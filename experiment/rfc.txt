@@ -1,0 +1,165 @@
+OnPacketSent(packet_number, pn_space, ack_eliciting, in_flight, sent_bytes):
+  sent_packets[pn_space][packet_number].packet_number =
+                                           packet_number
+  sent_packets[pn_space][packet_number].time_sent = now()
+  sent_packets[pn_space][packet_number].ack_eliciting =
+                                           ack_eliciting
+  sent_packets[pn_space][packet_number].in_flight = in_flight
+  sent_packets[pn_space][packet_number].sent_bytes = sent_bytes
+  if (in_flight):
+    if (ack_eliciting):
+      time_of_last_ack_eliciting_packet[pn_space] = now()
+    OnPacketSentCC(sent_bytes)
+    SetLossDetectionTimer()
+
+
+OnDatagramReceived(datagram):
+  // If this datagram unblocks the server, arm the
+  // PTO timer to avoid deadlock.
+  if (server was at anti-amplification limit):
+    SetLossDetectionTimer()
+    if loss_detection_timer.timeout < now():
+      // Execute PTO if it would have expired
+      // while the amplification limit applied.
+      OnLossDetectionTimeout()
+
+
+IncludesAckEliciting(packets):
+  for packet in packets:
+    if (packet.ack_eliciting):
+      return true
+  return false
+
+
+
+
+OnAckReceived(ack, pn_space):
+  if (largest_acked_packet[pn_space] == infinite):
+    largest_acked_packet[pn_space] = ack.largest_acked
+  else:
+    largest_acked_packet[pn_space] = max(largest_acked_packet[pn_space], ack.largest_acked)
+
+  // DetectAndRemoveAckedPackets finds packets that are newly
+  // acknowledged and removes them from sent_packets.
+  newly_acked_packets = DetectAndRemoveAckedPackets(ack, pn_space)
+  // Nothing to do if there are no newly acked packets.
+  if (newly_acked_packets.empty()):
+    return
+
+  // Update the RTT if the largest acknowledged is newly acked
+  // and at least one ack-eliciting was newly acked.
+  if (newly_acked_packets.largest().packet_number ==
+          ack.largest_acked &&
+      IncludesAckEliciting(newly_acked_packets)):
+    latest_rtt =
+      now() - newly_acked_packets.largest().time_sent
+    UpdateRtt(ack.ack_delay)
+
+  // Process ECN information if present.
+  if (ACK frame contains ECN information):
+      ProcessECN(ack, pn_space)
+
+  lost_packets = DetectAndRemoveLostPackets(pn_space)
+  if (!lost_packets.empty()):
+    OnPacketsLost(lost_packets)
+  OnPacketsAcked(newly_acked_packets)
+
+  // Reset pto_count unless the client is unsure if
+  // the server has validated the client's address.
+  if (PeerCompletedAddressValidation()):
+    pto_count = 0
+  SetLossDetectionTimer()
+
+
+UpdateRtt(ack_delay):
+  if (first_rtt_sample == 0):
+    min_rtt = latest_rtt
+    smoothed_rtt = latest_rtt
+    rttvar = latest_rtt / 2
+    first_rtt_sample = now()
+    return
+
+  // min_rtt ignores acknowledgment delay.
+  min_rtt = min(min_rtt, latest_rtt)
+  // Limit ack_delay by max_ack_delay after handshake
+  // confirmation.
+  if (handshake confirmed):
+    ack_delay = min(ack_delay, max_ack_delay)
+
+  // Adjust for acknowledgment delay if plausible.
+  adjusted_rtt = latest_rtt
+  if (latest_rtt >= min_rtt + ack_delay):
+    adjusted_rtt = latest_rtt - ack_delay
+
+  rttvar = 3/4 * rttvar + 1/4 * abs(smoothed_rtt - adjusted_rtt)
+  smoothed_rtt = 7/8 * smoothed_rtt + 1/8 * adjusted_rtt
+
+
+GetLossTimeAndSpace():
+  time = loss_time[Initial]
+  space = Initial
+  for pn_space in [ Handshake, ApplicationData ]:
+    if (time == 0 || loss_time[pn_space] < time):
+      time = loss_time[pn_space];
+      space = pn_space
+  return time, space
+
+GetPtoTimeAndSpace():
+  duration = (smoothed_rtt + max(4 * rttvar, kGranularity))
+      * (2 ^ pto_count)
+  // Anti-deadlock PTO starts from the current time
+  if (no ack-eliciting packets in flight):
+    assert(!PeerCompletedAddressValidation())
+    if (has handshake keys):
+      return (now() + duration), Handshake
+    else:
+      return (now() + duration), Initial
+  pto_timeout = infinite
+  pto_space = Initial
+  for space in [ Initial, Handshake, ApplicationData ]:
+    if (no ack-eliciting packets in flight in space):
+        continue;
+    if (space == ApplicationData):
+      // Skip Application Data until handshake confirmed.
+      if (handshake is not confirmed):
+        return pto_timeout, pto_space
+      // Include max_ack_delay and backoff for Application Data.
+      duration += max_ack_delay * (2 ^ pto_count)
+
+    t = time_of_last_ack_eliciting_packet[space] + duration
+    if (t < pto_timeout):
+      pto_timeout = t
+      pto_space = space
+  return pto_timeout, pto_space
+
+PeerCompletedAddressValidation():
+  // Assume clients validate the server's address implicitly.
+  if (endpoint is server):
+    return true
+  // Servers complete address validation when a
+  // protected packet is received.
+  return has received Handshake ACK ||
+       handshake confirmed
+
+SetLossDetectionTimer():
+  earliest_loss_time, _ = GetLossTimeAndSpace()
+  if (earliest_loss_time != 0):
+    // Time threshold loss detection.
+    loss_detection_timer.update(earliest_loss_time)
+    return
+
+  if (server is at anti-amplification limit):
+    // The server's timer is not set if nothing can be sent.
+    loss_detection_timer.cancel()
+    return
+
+  if (no ack-eliciting packets in flight &&
+      PeerCompletedAddressValidation()):
+    // There is nothing to detect lost, so no timer is set.
+    // However, the client needs to arm the timer if the
+    // server might be blocked by the anti-amplification limit.
+    loss_detection_timer.cancel()
+    return
+
+  timeout, _ = GetPtoTimeAndSpace()
+  loss_detection_timer.update(timeout)

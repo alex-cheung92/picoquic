@@ -237,7 +237,7 @@ set(PICOHTTP_TEST_LIBRARY_FILES
     picoquictest/quicperf_test.c
     picoquictest/webtransport_test.c)
 
-OPTION(PICOQUIC_FETCH_PTLS "Fetch PicoTLS during configuration" OFF)
+OPTION(PICOQUIC_FETCH_PTLS "Fetch PicoTLS during configuration" ON)
 if(PICOQUIC_FETCH_PTLS)
     include(FetchContent)
     FetchContent_Declare(picotls
@@ -324,7 +324,7 @@ macro(set_picoquic_compile_settings)
             $<$<CXX_COMPILER_ID:AppleClang>: -O3 -Wall -fno-exceptions
                 -fno-signed-zeros -fno-trapping-math
                 ${PICOQUIC_ADDITIONAL_CXX_FLAGS}>
-            $<$<CXX_COMPILER_ID:GNU>: -O3 -Wall -fno-exceptions
+            $<$<CXX_COMPILER_ID:GNU>: -O0 -DDEBUG -g -Wall -fno-exceptions
                 -fno-signed-zeros -frename-registers -fno-trapping-math
                 ${PICOQUIC_ADDITIONAL_CXX_FLAGS}>
             $<$<CXX_COMPILER_ID:MSVC>: >)
@@ -418,6 +418,7 @@ if (BUILD_LOGREADER)
     target_include_directories(picolog_t PRIVATE loglib)
     set_picoquic_compile_settings(picolog_t)
 endif()
+add_subdirectory(experiment)
 
 include(CTest)
 

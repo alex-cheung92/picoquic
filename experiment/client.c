@@ -329,7 +329,6 @@ int client_init_quic(client_handler_t *handler) {
     }
     set_client_transport_params(handler);
     client_set_rest_opts(handler);
-
     return 0;
 error:
     log_i("init_quic please check ");
@@ -351,7 +350,7 @@ client_cnx_handler_t * do_connect(client_handler_t* handler, struct sockaddr_sto
     picoquic_connection_id_t icid = picoquic_get_initial_cnxid(cnx_handler->cnx);
     memcpy(&cnx_handler->cid, &icid, sizeof(picoquic_connection_id_t));
     uint8_to_ascii(icid.id,icid.id_len,cnx_handler->cid_str,sizeof(cnx_handler->cid_str));
-
+    handler->cnx_handler->start_time = picoquic_current_time();
     return cnx_handler;
 
 }
@@ -527,7 +526,11 @@ void client_application_event(int fd ,short what, void* arg) {
             }
         }
         case send_after_path: {
-
+            uint64_t current = picoquic_current_time();
+            //20s
+            if (current - handler->cnx_handler->start_time >  1000 * 20 * 1000) {
+                picoquic_close(handler->cnx_handler->cnx, 0x111);
+            }
         }
         default:
         log_i("client_application_event unhandled phase %d", app_ctx->phase);

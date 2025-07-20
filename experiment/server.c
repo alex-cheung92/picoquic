@@ -242,7 +242,7 @@ int server_callback(picoquic_cnx_t* cnx, uint64_t stream_id, uint8_t* bytes, siz
     no_print_event = fin_or_event == picoquic_callback_prepare_to_send || fin_or_event == picoquic_callback_stream_data||
         fin_or_event == picoquic_callback_stream_fin ;
     if (!no_print_event) {
-        log_i("%s ", event_mapping[fin_or_event]);
+        log_i("%s stream/path id %lu", event_mapping[fin_or_event], stream_id);
     }
 
 

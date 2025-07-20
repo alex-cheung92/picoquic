@@ -16,6 +16,7 @@ typedef struct client_cnx_handler {
     char cid_str[20];
     client_handler_t *client_handler;
     int rpc_sent;
+    uint64_t start_time;
 }client_cnx_handler_t;
 
 typedef enum quic_state{

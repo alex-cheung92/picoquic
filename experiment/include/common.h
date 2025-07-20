@@ -10,19 +10,84 @@
 #include <sys/socket.h>
 #include <arpa/inet.h>
 #include <picoquic_utils.h>
-
+#include <string.h>
+#include <stdint.h>
+#include <time.h>
+#include <sys/time.h>
 
 #define ALPN "test"
 
+typedef enum phase {
+    wait_create_stream0,
+    send_data1,
+    probe_path,
+    send_after_path,
+    wait_create_stream1,
+    close_stream0,
+    close_stream1,
+    close_conn
+}phase_t;
+
+typedef struct application_ctx {
+    struct event *app_event;
+    phase_t phase;
+    uint8_t *send_buffer;
+    int send_idx;
+    uint8_t *recv_buffer;
+    int recv_idx;
+    int send_buffer_size;
+    int recv_buffer_size;
+
+    uint64_t sequence;
+}application_ctx_t;
+
+static inline void appctx_data_recv(application_ctx_t* appctx, uint8_t *data, int length) {
+    if (length == 0) {
+        return;
+    }
+    memcpy(appctx->recv_buffer + appctx->recv_idx, data, length);
+    appctx->recv_idx += length;
+}
+
+static inline int appctx_recv_available_size(application_ctx_t* appctx) {
+    int recv_can_use = appctx->recv_buffer_size - appctx->recv_idx;
+    return recv_can_use;
+}
+
+static inline int appctx_used_len(application_ctx_t* appctx) {
+    return appctx->recv_idx;
+}
+
+
+//return copied number of bytes
+static inline int  appctx_recv_copy_out(application_ctx_t* appctx, uint8_t*dst, int dst_lenght) {
+    if (dst_lenght<=0) {
+        return 0;
+    }
+    int bytes_copy = dst_lenght;
+    int avai = appctx_used_len(appctx);
+    if (avai<bytes_copy) {
+        bytes_copy = avai;
+    }
+    if (bytes_copy>0) {
+        memcpy(dst, appctx->recv_buffer, bytes_copy);
+    }
+    if (appctx->recv_idx == bytes_copy) {
+        appctx->recv_idx = 0;
+    }else {
+        appctx->recv_idx -= bytes_copy;
+    }
+    return bytes_copy;
+}
+
+
 typedef struct socket_handler {
     int fd;
-    int local_port;
+    uint16_t local_port;
     struct event *ev_sock;
     int ifx_idx;
     int path_id;
 }socket_handler_t;
-
-
 
 static char* event_mapping[] = {
     [picoquic_callback_stream_data] = "picoquic_callback_stream_data",
@@ -54,6 +119,8 @@ static char* event_mapping[] = {
 };
 
 
+
+
 static inline void log_facade(char * level,char *file, char * func ,int line, char * fmt, ...)
 #if defined(__GNUC__)
 __attribute__ (( format (printf, 5, 6) ))
@@ -74,18 +141,25 @@ static inline void uint8_to_ascii(uint8_t * buf, int length, char *char_buff, in
 
 
 static inline void log_facade(char * level,char *file, char * func ,int line, char * fmt, ...) {
-    char fmt_buf[512];
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    struct tm *local = localtime(&tv.tv_sec);
+    char time_str[64] = {0};
+    strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M:%S", local);
+    char final_str[70] = {0};
+    snprintf(final_str, sizeof(final_str), "%s.%03ld", time_str, tv.tv_usec / 1000);
+
+    char fmt_buf[512] = {0};
     char * tmp = fmt_buf;
     int used = 0;
     int remain = sizeof(fmt_buf);
-    used += snprintf(fmt_buf + used, remain, "%s %s:%d %s %s \n", level, file, line ,func ,fmt);
+    used += snprintf(fmt_buf + used, remain, "%s %s %s:%d %s %s \n", final_str, level, file, line ,func ,fmt);
     remain -= used;
     va_list ap;
     va_start(ap, fmt);
     log(fmt_buf, ap);
     va_end(ap);
 }
-
 
 #define log_i(fmt, args...) log_facade("INFO",__FILE__,__FUNCTION__,__LINE__,fmt,##args)
 

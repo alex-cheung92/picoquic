@@ -22,13 +22,17 @@ add_executable(server_main
 )
 target_link_libraries(server_main PRIVATE experiment)
 
-
-
 add_executable(client_main
         client_main.c
         ${EXPERIMENT_SOURCES}
         include/rpc.h
 )
 target_link_libraries(client_main PRIVATE experiment)
+
+add_executable(my_test
+        test/test_buffer.c
+)
+target_link_libraries(my_test PRIVATE experiment)
+
 
 

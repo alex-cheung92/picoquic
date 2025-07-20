@@ -8,6 +8,7 @@
 #include <net/if.h>
 #include <fcntl.h>
 #include "common.h"
+#include "rpc.h"
 
 socket_handler_t* client_find_socket_by_fd(client_handler_t *handler, int fd) {
     for (int i = 0;i < CLIENT_PATH_NUM;i++) {
@@ -32,8 +33,6 @@ socket_handler_t* client_find_socket_by_localaddr(client_handler_t *handler,  st
 socket_handler_t* client_get_default_socket(client_handler_t *handler) {
     return &handler->sockets[0];
 }
-
-
 
 int client_setup_event(client_handler_t *handler) {
     handler->ev_pico = event_new(handler->event_base, -1, EV_TIMEOUT | EV_PERSIST, client_timer_event, handler);
@@ -68,6 +67,7 @@ client_handler_t* client_alloc_handler(struct event_base *event_base) {
     handler->event_base = event_base;
     handler->send_buffer_size = 2000;
     handler->send_buffer = malloc(handler->send_buffer_size);
+    handler->quic_state = INIT;
     memset(handler->send_buffer, 0, handler->send_buffer_size);
     return handler;
 }
@@ -94,6 +94,7 @@ int create_bind_fd(int port, client_handler_t *handler, int idx) {
     if (bind(fd, v4, sizeof(struct sockaddr_in))<0){
         goto error;
     }
+    log_i("create bind fd %d with port %d success",fd, port);
     return 0;
 error:
     log_i("create fd %d error", idx);
@@ -128,11 +129,13 @@ int client_send_socket(picoquic_cnx_t* last_cnx,int fd, struct sockaddr* addr_de
         }
         sock_ret = picoquic_sendmsg(fd, addr_dest, addr_from, if_index, (buff + packet_index), (int)packet_size, 0, &sock_err);
         if (sock_ret > 0) {
+#ifdef SOCKET_LOG
             char from[64];
             sockaddr_text(addr_from, from, sizeof(from));
             char to[64];
             sockaddr_text(addr_dest, to, sizeof(to));
-            log_i("[%s -> %s] ifidx:%d Len:%d",from, to, if_index, packet_size);
+            log_i("[%s -> %s] fd:%d ifidx:%d Len:%d",from, to, fd, if_index, packet_size);
+#endif
             packet_index += packet_size;
         } else if (picoquic_socket_error_implies_unreachable(sock_err)) {
             picoquic_notify_destination_unreachable(last_cnx, picoquic_current_time(), addr_dest, addr_from, if_index, sock_err);
@@ -164,10 +167,10 @@ void client_timer_event(int fd, short what, void * arg) {
                                                 &peer_addr, &local_addr, &if_index, &log_cid, &last_cnx,
                                                 &mtu);
 
-        if (send_length>0) {
-            char tmp[64];
-            log_i("client picoquic_prepare_next_packet_ex local_addr:%s", sockaddr_text(&local_addr, tmp,sizeof(tmp)));
-        }
+        // if (send_length>0) {
+            // char tmp[64];
+            // log_i("client picoquic_prepare_next_packet_ex local_addr:%s", sockaddr_text(&local_addr, tmp,sizeof(tmp)));
+        // }
         socket_handler_t* socket_handler = client_find_socket_by_localaddr(handler, &local_addr);
         if (socket_handler == NULL) {
             socket_handler = client_get_default_socket(handler);
@@ -203,10 +206,6 @@ void client_timer_event(int fd, short what, void * arg) {
     }
 }
 
-
-
-
-
 void client_socket_event(int fd, short what, void *arg) {
     client_handler_t *handler = arg;
     uint8_t buffer[1536];
@@ -227,27 +226,36 @@ void client_socket_event(int fd, short what, void *arg) {
         if (socket == NULL) {
             return;
         }
-
         while( (bytes_recv = picoquic_recvmsg(socket->fd, &addr_from,
             &addr_to, &if_index_to, &received_ecn, buffer, sizeof(buffer))) > 0 ) {
             current_time = picoquic_current_time();
             if(addr_to.ss_family == AF_INET6) {
                 log_i("ipv6 not happen");
             } else if (addr_to.ss_family == AF_INET) {
-                ((struct sockaddr_in*)&addr_to)->sin_port = ((struct sockaddr_in*)&(socket))->sin_port;
+                // char tmp[64];
+                // sockaddr_text(&addr_to, tmp, sizeof(tmp));
+                // log_i("recv afinet before set :%s", tmp);
+                // ((struct sockaddr_in*)&addr_to)->sin_port = ((struct sockaddr_in*)&(socket))->sin_port;
             }else {
+                // char tmp[64];
+                // sockaddr_text(&addr_to, tmp, sizeof(tmp));
+                // log_i("recv unset before :%s", tmp);
                 addr_to.ss_family = AF_INET;
                 ((struct sockaddr_in*)&addr_to)->sin_port = htons(socket->local_port);
                 inet_aton("127.0.0.1", &((struct sockaddr_in*)&addr_to)->sin_addr);
+                // sockaddr_text(&addr_to, tmp, sizeof(tmp));
+                // log_i("recv unset after :%s", tmp);
             }
             if (if_index_to == 0) {
                 if_index_to = socket->ifx_idx;
             }
+#ifdef SOCKET_LOG
             char from[64];
             sockaddr_text(&addr_from, from, sizeof(from));
             char to[64];
             sockaddr_text(&addr_to, to, sizeof(to));
             log_i("[%s <- %s] ifidx:%d Len:%d", to, from, if_index_to, bytes_recv);
+#endif
             (void)picoquic_incoming_packet_ex(handler->quic, buffer,
                 (size_t)bytes_recv, (struct sockaddr*) & addr_from,
                         (struct sockaddr*) & addr_to, if_index_to, received_ecn,
@@ -299,10 +307,12 @@ void set_client_transport_params(client_handler_t *handler) {
 
 void client_set_rest_opts(client_handler_t *handler) {
     picoquic_set_default_congestion_algorithm(handler->quic, picoquic_bbr_algorithm);
-    picoquic_set_default_idle_timeout(handler->quic, 1000*60*60);
+    picoquic_set_default_idle_timeout(handler->quic, 1000*60*1000);
     picoquic_set_qlog(handler->quic, "./qlog");
     picoquic_set_log_level(handler->quic, 1);
     picoquic_enable_path_callbacks_default(handler->quic, 1);
+    picoquic_enable_sslkeylog(handler->quic, 1);
+    picoquic_set_key_log_file(handler->quic,"./pcap/client_sslkeylog.txt");
 }
 
 void client_set_cnx_ops(client_handler_t *handler) {
@@ -326,6 +336,7 @@ error:
     return -1;
 }
 void client_setup_cnx_config(client_handler_t* handler) {
+    // picoquic_enable_keep_alive(handler->cnx_handler->cnx,1000000);
     picoquic_enable_keep_alive(handler->cnx_handler->cnx,0);
     client_set_cnx_ops(handler);
 }
@@ -333,10 +344,10 @@ void client_setup_cnx_config(client_handler_t* handler) {
 client_cnx_handler_t * do_connect(client_handler_t* handler, struct sockaddr_storage *to) {
     client_cnx_handler_t * cnx_handler = malloc(sizeof(client_cnx_handler_t));
     memset(cnx_handler,0,sizeof(client_cnx_handler_t));
+    cnx_handler-> rpc_sent = 0;
     cnx_handler -> client_handler = handler;
-    cnx_handler->cnx = picoquic_create_cnx(handler->quic,picoquic_null_connection_id,picoquic_null_connection_id,to, picoquic_current_time(),0, NULL, ALPN, 1);
+    cnx_handler->cnx = picoquic_create_cnx(handler->quic,picoquic_null_connection_id,picoquic_null_connection_id, to, picoquic_current_time(),0, NULL, ALPN, 1);
     handler->cnx_handler = cnx_handler;
-
     picoquic_connection_id_t icid = picoquic_get_initial_cnxid(cnx_handler->cnx);
     memcpy(&cnx_handler->cid, &icid, sizeof(picoquic_connection_id_t));
     uint8_to_ascii(icid.id,icid.id_len,cnx_handler->cid_str,sizeof(cnx_handler->cid_str));
@@ -367,38 +378,181 @@ error:
     return -1;
 }
 
+void print_ack_info(client_handler_t *handler , application_ctx_t* appctx) {
+    uint8_t tmp[RPC_MSG_LENGTH];
+    if (appctx_used_len(appctx)>= RPC_MSG_LENGTH) {
+        appctx_recv_copy_out(appctx, tmp, RPC_MSG_LENGTH);
+        rpc_msg_t* msg = tmp;
+        uint64_t* data = msg->data;
+        log_i("client receive acked:%ld", *data);
+        handler->cnx_handler->rpc_sent = 0;
+    }
+
+}
 
 int client_callback(picoquic_cnx_t* cnx, uint64_t stream_id, uint8_t* bytes, size_t length, picoquic_call_back_event_t fin_or_event, void* callback_ctx, void* v_stream_ctx) {
+    int no_print_event = 0;
+    no_print_event = fin_or_event == picoquic_callback_prepare_to_send || fin_or_event == picoquic_callback_stream_data||
+        fin_or_event == picoquic_callback_stream_fin ;
+    if (!no_print_event) {
+        log_i("%s ", event_mapping[fin_or_event]);
+    }
     client_handler_t *handler = callback_ctx;
-    log_i("event:%s", event_mapping[fin_or_event]);
+    application_ctx_t* appctx = handler->application_ctx;
     if (fin_or_event == picoquic_callback_path_available) {
-        log_i("event:%s path id:%lu", event_mapping[fin_or_event], stream_id);
+        struct sockaddr_storage local = {0};
+        struct sockaddr_storage remote = {0};
+        picoquic_get_path_addr(cnx, stream_id,1, &local);
+        picoquic_get_path_addr(cnx, stream_id,2, &remote);
+        char local_str[64];
+        char remote_str[64];
+        sockaddr_text(&local,local_str,sizeof(local_str));
+        sockaddr_text(&remote_str,remote_str,sizeof(remote_str));
+        log_i("event:%s path is available id :%lu, local:%s, remote:%s", event_mapping[fin_or_event], stream_id, local_str, remote_str);
+        return 0;
     }
-    if (fin_or_event == picoquic_callback_ready) {
 
+    if (fin_or_event == picoquic_callback_ready) {
+        handler->quic_state = CONNECTED;
+        return 0;
+    }else if (fin_or_event == picoquic_callback_close) {
+        handler->quic_state = DISCONNECTED;
+        uint64_t local_reason = 0;
+        uint64_t remote_reason = 0;
+        uint64_t local_application_reason = 0;
+        uint64_t remote_application_reason = 0;
+        picoquic_get_close_reasons(cnx, &local_reason, &remote_reason, &local_application_reason, &remote_application_reason);
+        log_i("application close local reason:%lu, remote reason:%lu, local application reason:%lu, remote application reaseon:%lu", local_reason, remote_reason, local_application_reason, remote_application_reason);
+        return 0;
     }
+
+    if (fin_or_event == picoquic_callback_stream_fin || fin_or_event == picoquic_callback_stream_data) {
+            if (appctx_recv_available_size(appctx)>=length) {
+                appctx_data_recv(appctx, bytes, length);
+                print_ack_info(handler, appctx);
+            }else {
+                log_i("appctx recv size is less than length");
+            }
+    }
+
+    if (fin_or_event == picoquic_callback_prepare_to_send) {
+        if (!handler->cnx_handler->rpc_sent) {
+            int len = RPC_MSG_LENGTH;
+            uint8_t*  write_buff =  picoquic_provide_stream_data_buffer(bytes, len,0, 1);
+            if (write_buff == NULL) {
+                log_i("picoquic_provide_stream_data_buffer return null");
+                return 0;
+            }
+            rpc_msg_t *msg = malloc(len);
+            memset(msg,0,sizeof(rpc_msg_t));
+            msg->type=0;
+            msg->version=0;
+            msg->length =  RPC_PAYLOAD_LENGTH;
+            memcpy(msg->data, &appctx->sequence,sizeof(appctx->sequence));
+            memcpy(write_buff, msg, len);
+            log_i("client sequence sent: %lu", appctx->sequence);
+            handler->cnx_handler->rpc_sent = 1;
+            appctx->sequence ++;
+            free(msg);
+        }else {
+            // log_i("redundant callback mark stream %lu inactive ", stream_id);
+            (void*)picoquic_provide_stream_data_buffer(bytes,0,0,0);
+        }
+    }
+
     return 0;
 }
 void client_application_event(int fd ,short what, void* arg) {
     client_handler_t* handler = arg;
     application_ctx_t* app_ctx = handler->application_ctx;
+    if (handler->quic_state == INIT) {
+        //connection not ready  wait 1 second
+        struct timeval tv = {.tv_sec=1, .tv_usec = 0};
+        event_add(app_ctx->app_event, &tv);
+        return;
+    }
+    if (handler->quic_state == DISCONNECTED) {
+        //connection disconnection cancel the event loop
+        log_i("disconnected");
+        event_del(app_ctx->app_event);
+        event_free(app_ctx->app_event);
+        app_ctx->app_event = NULL;
+        return;
+    }
+    if (handler->quic_state == CONNECTED) {
+        if (app_ctx->phase>wait_create_stream0 && app_ctx->phase<=wait_create_stream1) {
+            if (!handler->cnx_handler->rpc_sent) {
+                picoquic_mark_active_stream(handler->cnx_handler->cnx, 0, 1, handler);
+            }
+        }
+    }
+
+    //do things by phase ...
     switch (app_ctx->phase) {
         case wait_create_stream0: {
-            picoquic_mark_active_stream(handler->cnx_handler->cnx, 0, 1, handler);
+            uint64_t stream0 = picoquic_get_next_local_stream_id(handler->cnx_handler->cnx, 0);
+            picoquic_mark_active_stream(handler->cnx_handler->cnx, stream0, 1, handler);
+            app_ctx->phase = send_data1;
         }
         break;
+        case send_data1: {
+            app_ctx->phase = probe_path;
+        }
+        break;
+        case probe_path: {
+            struct sockaddr_storage remote = {0};
+            struct sockaddr_in *   remotev4 = &remote;
+            remotev4->sin_family = AF_INET;
+            remotev4->sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+            remotev4->sin_port = htons(28256);
+            struct sockaddr_storage local = {0};
+            struct sockaddr_in * localv4 = &local;
+            localv4->sin_family = AF_INET;
+            localv4->sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+            localv4->sin_port = htons(50001);
+            int allow = 0;
+            int probe_ret = picoquic_subscribe_new_path_allowed(handler->cnx_handler->cnx, &allow);
+            if (probe_ret!=0) {
+                log_i("picoquic_subscribe_new_path_allowed failed ret %d", probe_ret);
+                return;
+            }else {
+                if (allow) {
+                    probe_ret = picoquic_probe_new_path(handler->cnx_handler->cnx,remotev4, localv4, picoquic_current_time());
+                    if (probe_ret!=0) {
+                        log_i("picoquic_probe_new_path failed ret %d", probe_ret);
+                    }else {
+                        app_ctx->phase = send_after_path;
+                    }
+                }
+            }
+        }
+        case send_after_path: {
+
+        }
         default:
-        log_i("client_application_event phase %d", app_ctx->phase);
+        log_i("client_application_event unhandled phase %d", app_ctx->phase);
     }
+    struct timeval tv = {.tv_sec=1, .tv_usec = 0};
+    event_add(app_ctx->app_event, &tv);
 
 }
 void client_setup_application_event(client_handler_t* handler) {
     if (handler->application_ctx == NULL) {
-        handler->application_ctx = malloc(sizeof(application_ctx_t));
-        application_ctx_t* app = handler->application_ctx;
+        application_ctx_t* app = malloc(sizeof(application_ctx_t));
+        memset(app, 0 , sizeof(application_ctx_t));
+        app->send_buffer_size = 16;
+        app->send_buffer = malloc(app->send_buffer_size);
+        memset(app->send_buffer, 0, app->send_buffer_size);
+        app->recv_buffer_size = 16;
+        app->recv_buffer = malloc(app->recv_buffer_size);
+        memset(app->recv_buffer, 0, app->recv_buffer_size);
+        app->sequence = 0;
+        app->send_idx = 0;
+        app->recv_idx = 0;
         app->phase = wait_create_stream0;
-        app->client_event = event_new(handler->event_base, -1, EV_PERSIST, client_application_event, handler);
-        event_add(app->client_event, NULL);
+        app->app_event = event_new(handler->event_base, -1, EV_TIMEOUT | EV_PERSIST, client_application_event, handler);
+        event_active(app->app_event,0, 1);
+        handler->application_ctx= app;
     }else {
         log_i("not expected");
     }

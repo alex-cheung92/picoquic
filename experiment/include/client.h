@@ -15,37 +15,31 @@ typedef struct client_cnx_handler {
     picoquic_connection_id_t cid;
     char cid_str[20];
     client_handler_t *client_handler;
+    int rpc_sent;
 }client_cnx_handler_t;
+
+typedef enum quic_state{
+    INIT,
+    CONNECTED,
+    DISCONNECTED,
+}quic_state_t;
 
 typedef struct client_handler {
     picoquic_quic_t * quic;
+    quic_state_t quic_state;
     client_cnx_handler_t* cnx_handler;
+    //for quic prepare used
+    uint8_t *send_buffer;
+    int send_buffer_size;
     //0 for default
     struct socket_handler sockets[CLIENT_PATH_NUM];
     struct event_base *event_base;
     struct event *ev_pico;
-    uint8_t* send_buffer;
-    int send_buffer_size;
     void *application_ctx; // application_ctx_t*
+
+
+
 }client_handler_t;
-
-typedef enum phase {
-    wait_create_stream0,
-    send_data1,
-    probe_path,
-    send_data2,
-    wait_create_stream1,
-    close_stream0,
-    close_stream1,
-    close_conn
-}phase_t;
-
-typedef struct application_ctx {
-    struct event *client_event;
-    phase_t phase;
-
-}application_ctx_t;
-
 
 void client_timer_event(int fd, short what, void* arg);
 void client_socket_event(int fd, short what, void* arg);

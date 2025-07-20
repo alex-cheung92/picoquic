@@ -12,8 +12,9 @@
 #include "picosocks.h"
 #include "autoqlog.h"
 #include <net/if.h>
+#include "rpc.h"
 
-int setup_event(server_handler_t *handler) {
+int server_setup_event(server_handler_t *handler) {
     handler->ev_pico = event_new(handler->event_base, -1, EV_TIMEOUT | EV_PERSIST, server_timer_event, handler);
     if (handler->ev_pico == NULL) {
         log_i("create ev_pico error");
@@ -43,10 +44,12 @@ server_handler_t* alloc_handler(struct event_base *event_base) {
     handler->send_buffer_size = 2000;
     handler->send_buffer = malloc(handler->send_buffer_size);
     memset(handler->send_buffer, 0, handler->send_buffer_size);
+
+    handler->need_response = 0;
     return handler;
 }
 
-int create_server_fd(int port, server_handler_t *handler) {
+int server_create_server_fd(int port, server_handler_t *handler) {
     int ret = 0;
     struct sockaddr_storage ss = {0};
     struct sockaddr_in* v4 = &ss;
@@ -84,24 +87,32 @@ int send_server_socket(picoquic_cnx_t* last_cnx,int fd, struct sockaddr* addr_de
     int sock_err;
     size_t packet_index = 0;
     size_t packet_size = mtu;
-
+    int error_cycle = 0;
+    int max_error_cycle_time = 3;
     while (packet_index < length) {
         if (packet_index + packet_size > length) {
             packet_size = length - packet_index;
         }
         sock_ret = picoquic_sendmsg(fd,addr_dest, addr_from, if_index, (buff + packet_index), (int)packet_size, 0, &sock_err);
         if (sock_ret > 0) {
+#ifdef SOCKET_LOG
             char from[64];
             sockaddr_text(addr_from, from, sizeof(from));
             char to[64];
             sockaddr_text(addr_dest, to, sizeof(to));
             log_i("[%s -> %s] ifidx:%d Len:%d",from, to, if_index, packet_size);
+#endif
             packet_index += packet_size;
         } else if (picoquic_socket_error_implies_unreachable(sock_err)) {
             picoquic_notify_destination_unreachable(last_cnx, picoquic_current_time(), addr_dest, addr_from, if_index, sock_err);
             return -1;
         }else {
-            log_i( "Retry with packet size=%zu fails at index %zu, ret=%d, err=%d.", packet_size, packet_index, sock_ret, sock_err);
+            error_cycle ++;
+            if (error_cycle> max_error_cycle_time) {
+                log_i("exceed retry number");
+                return -1;
+            }
+            log_i( "Retry with packet size=%zu fails at index %zu, ret=%d, err=%d, str=%s", packet_size, packet_index, sock_ret, sock_err,strerror(sock_err));
             break;
         }
     }
@@ -180,11 +191,13 @@ void server_socket_event(int fd, short what, void *arg) {
             if (if_index_to == 0) {
                 if_index_to = socket->ifx_idx;
             }
+#ifdef SOCKET_LOG
             char from[64];
             sockaddr_text(&addr_from, from, sizeof(from));
             char to[64];
             sockaddr_text(&addr_to, to, sizeof(to));
             log_i("[%s <- %s] ifidx:%d Len:%d", to, from, if_index_to, bytes_recv);
+#endif
             (void)picoquic_incoming_packet_ex(handler->quic, buffer,
                 (size_t)bytes_recv, (struct sockaddr*) & addr_from,
                         (struct sockaddr*) & addr_to, if_index_to, received_ecn,
@@ -208,12 +221,88 @@ void server_socket_event(int fd, short what, void *arg) {
 }
 
 
+int consume_data(application_ctx_t* appctx) {
+    int bytes_to_consume = RPC_MSG_LENGTH;
+    uint8_t tmp[bytes_to_consume];
+    if (appctx_used_len(appctx)>=bytes_to_consume) {
+        appctx_recv_copy_out(appctx, tmp, bytes_to_consume);
+        rpc_msg_t * msg = tmp;
+        appctx->sequence = *((uint64_t*)msg->data);
+        log_i("server recv sequence:%lu", appctx->sequence);
+        return 1;
+    }else {
+        return 0;
+    }
 
-int server_callback(picoquic_cnx_t* cnx,
-    uint64_t stream_id, uint8_t* bytes, size_t length,
+}
+
+int server_callback(picoquic_cnx_t* cnx, uint64_t stream_id, uint8_t* bytes, size_t length,
     picoquic_call_back_event_t fin_or_event, void* callback_ctx, void* v_stream_ctx) {
+    int no_print_event = 0;
+    no_print_event = fin_or_event == picoquic_callback_prepare_to_send || fin_or_event == picoquic_callback_stream_data||
+        fin_or_event == picoquic_callback_stream_fin ;
+    if (!no_print_event) {
+        log_i("%s ", event_mapping[fin_or_event]);
+    }
+
+
     server_handler_t *handler = callback_ctx;
-    log_i("%s ", event_mapping[fin_or_event]);
+    application_ctx_t* appctx = handler->appctx;
+    if (fin_or_event == picoquic_callback_path_available) {
+        struct sockaddr_storage local = {0};
+        struct sockaddr_storage remote = {0};
+        picoquic_get_path_addr(cnx, stream_id,1, &local);
+        picoquic_get_path_addr(cnx, stream_id,2, &remote);
+        char local_str[64];
+        char remote_str[64];
+        sockaddr_text(&local,local_str,sizeof(local_str));
+        sockaddr_text(&remote_str,remote_str,sizeof(remote_str));
+        log_i("event:%s path is available id :%lu, local:%s, remote:%s", event_mapping[fin_or_event], stream_id, local_str, remote_str);
+        return 0;
+    }
+
+    if (fin_or_event == picoquic_callback_stream_data || fin_or_event == picoquic_callback_stream_fin) {
+        int len = length;
+        uint8_t *data = bytes;
+        if (appctx_recv_available_size(appctx)>=len) {
+            appctx_data_recv(appctx, data, len);
+        }else {
+            log_i("server recv buffer not enough");
+        }
+        if (consume_data(appctx)) {
+            picoquic_mark_active_stream(cnx, stream_id, 1, v_stream_ctx);
+            handler->need_response = 1;
+        }else {
+            picoquic_mark_active_stream(cnx, stream_id, 0, v_stream_ctx);
+        }
+
+        return 0;
+    }
+    if (fin_or_event == picoquic_callback_prepare_to_send) {
+        if (length<RPC_MSG_LENGTH) {
+            return 0;
+        }
+        if (handler->need_response) {
+            uint8_t * write_buf = picoquic_provide_stream_data_buffer(bytes,RPC_MSG_LENGTH, 0, 1);
+            if (write_buf == NULL) {
+                log_i("server provide stream data buffer failed");
+            }else {
+                rpc_msg_t * msg = malloc(RPC_MSG_LENGTH);
+                msg->type = 1;
+                msg->version = 0;
+                msg->length = RPC_PAYLOAD_LENGTH;
+                memcpy(msg->data, &appctx->sequence, RPC_PAYLOAD_LENGTH);
+                memcpy(write_buf, msg, RPC_MSG_LENGTH);
+                free(msg);
+                handler->need_response = 0;
+            }
+        }else {
+            // log_i("redundant picoquic_callback_prepare_to_send callback mark %lu inactive ", stream_id);
+            (void*)picoquic_provide_stream_data_buffer(bytes,0,0,0);
+        }
+
+    }
+
     return 0;
 }
 
@@ -246,9 +335,12 @@ void set_rest_opts(server_handler_t *handler) {
     picoquic_set_qlog(handler->quic, "./qlog");
     picoquic_set_log_level(handler->quic, 1);
     picoquic_enable_path_callbacks_default(handler->quic, 1);
+    picoquic_enable_sslkeylog(handler->quic, 1);
+    picoquic_set_key_log_file(handler->quic,"./pcap/server_sslkeylog.txt");
+
 }
 
-int init_quic(server_handler_t *handler) {
+int sever_init_quic(server_handler_t *handler) {
     handler->quic = picoquic_create(1,CERT_FILE, KEY_FILE, NULL,
         ALPN, server_callback,handler, NULL, NULL, NULL,
         picoquic_current_time(),NULL,NULL,NULL, 0);
@@ -263,12 +355,28 @@ error:
     return -1;
 }
 
+void server_create_init_application_event(server_handler_t* handler ) {
+    if (handler->appctx == NULL) {
+        application_ctx_t* appctx = malloc(sizeof(application_ctx_t));
+        memset(appctx, 0, sizeof(application_ctx_t));
+        handler->appctx = appctx;
+        appctx->recv_idx = 0;
+        appctx->send_idx = 0;
+
+        appctx->send_buffer_size = 64;
+        appctx->recv_buffer_size = 64;
+        appctx->send_buffer = malloc(appctx->send_buffer_size);
+        appctx->recv_buffer = malloc(appctx->recv_buffer_size);
+
+    }
+}
 
 void server_init_and_dispatch(struct event_base *event_base) {
     server_handler_t* handler = alloc_handler(event_base);
-    init_quic(handler);
-    create_server_fd(28256, handler);
-    setup_event(handler);
+    sever_init_quic(handler);
+    server_create_server_fd(28256, handler);
+    server_setup_event(handler);
+    server_create_init_application_event(handler);
     log_i("server started using %s ", event_base_get_method(event_base));
     int ret = event_base_dispatch(handler->event_base);
     log_i("dispatch return %d ",ret );

@@ -15,4 +15,7 @@ typedef struct rpc_msg{
 } rpc_msg_t;
 
 #pragma pack()
+#define RPC_HDR_LENGTH (sizeof(rpc_msg_t))
+#define RPC_PAYLOAD_LENGTH (sizeof(uint64_t))
+#define RPC_MSG_LENGTH (RPC_HDR_LENGTH+RPC_PAYLOAD_LENGTH)
 #endif //RPC_H

@@ -2892,6 +2892,12 @@ namespace UnitTest1
             Assert::AreEqual(ret, 0);
         }
 
+        TEST_METHOD(multipath_keep_alive) {
+            int ret = multipath_keep_alive_test();
+
+            Assert::AreEqual(ret, 0);
+        }
+
         TEST_METHOD(multipath_qlog) {
             int ret = multipath_qlog_test();
 
@@ -3247,6 +3253,18 @@ namespace UnitTest1
         }
         TEST_METHOD(grease_quic_bit) {
             int ret = grease_quic_bit_test();
+
+            Assert::AreEqual(ret, 0);
+        }
+
+        TEST_METHOD(picomask_udp) {
+            int ret = picomask_udp_test();
+
+            Assert::AreEqual(ret, 0);
+        }
+
+        TEST_METHOD(picomask_udp_path) {
+            int ret = picomask_udp_path_test();
 
             Assert::AreEqual(ret, 0);
         }

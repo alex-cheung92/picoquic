@@ -253,8 +253,8 @@ int server_callback(picoquic_cnx_t* cnx, uint64_t stream_id, uint8_t* bytes, siz
         struct sockaddr_storage remote = {0};
         picoquic_get_path_addr(cnx, stream_id,1, &local);
         picoquic_get_path_addr(cnx, stream_id,2, &remote);
-        char local_str[64];
-        char remote_str[64];
+        char local_str[64] = {0};
+        char remote_str[64] = {0};
         sockaddr_text(&local,local_str,sizeof(local_str));
         sockaddr_text(&remote_str,remote_str,sizeof(remote_str));
         log_i("event:%s path is available id :%lu, local:%s, remote:%s", event_mapping[fin_or_event], stream_id, local_str, remote_str);
